@@ -8,7 +8,13 @@ import json
 import re
 import ssl
 from typing import Optional, Union
+from json import JSONDecodeError
 
+import structlog
+import curlify2
+import allure
+import asyncio
+from unittest.mock import MagicMock
 import aiohttp
 import aiohttp_retry
 
@@ -199,6 +205,48 @@ class RESTClientObject:
                 )
             pool_manager = self.retry_client
 
-        r = await pool_manager.request(**args)
+        return await self._logged_request(pool_manager, **args)
 
-        return RESTResponse(r)
+    async def _logged_request(self, pool_manager, **args) -> RESTResponse:
+        log = structlog.get_logger().bind(service='api')
+        json_data = args.get("data") if args.get("data") else "{}"
+        json_dict = json.loads(json_data)
+        log.msg(
+            'request',
+            method=args.get("method"),
+            url=args.get("url"),
+            headers=args.get("headers"),
+            json=json_dict
+        )
+        requests = MagicMock(**args, body=json_data)
+        curl = curlify2.Curlify(request=requests).to_curl()
+        print(curl)
+        allure.attach(curl, name="curl", attachment_type=allure.attachment_type.TEXT)
+        allure.attach(json.dumps(json_dict, indent=4), name="request", attachment_type=allure.attachment_type.JSON)
+        try:
+            r = await pool_manager.request(**args)
+        except RuntimeError as e:
+            if 'Event loop is closed' in e.args[0]:
+                asyncio.run(self.pool_manager.__aexit__(None, None, None))
+        else:
+            log_response = r.__dict__
+            data = await r.read()
+            try:
+                json_data = json.loads(data)
+                attachment_type = allure.attachment_type.JSON
+            except JSONDecodeError:
+                json_data = str(data)
+                attachment_type = allure.attachment_type.TEXT
+
+
+            log.msg(
+                'response',
+                method=args.get("method"),
+                url=log_response.get("_url"),
+                headers=dict(log_response.get("_headers", {})),
+                json=json_data,
+                status_code=log_response.get('status')
+            )
+            content = json.dumps(json_data, indent=4) if attachment_type == allure.attachment_type.JSON else json_data
+            allure.attach(content, name="response", attachment_type=attachment_type)
+            return RESTResponse(r)
